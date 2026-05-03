@@ -4,7 +4,7 @@ on:
   schedule:
     # 06:00 UTC = 07:00 invierno / 08:00 verano hora Madrid
     # Lunes a viernes (los mercados están cerrados sábados)
-    - cron: '0 6 * * 1-5'
+    - cron: '0 4 * * 1-5'
   workflow_dispatch:  # Permite ejecutarlo manualmente desde GitHub
 
 jobs:
