@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Alertas XAU/USD - v2
-Dos tipos de alertas:
-  - PROXIMIDAD: precio cerca de un pivot (sin importar RSI)
-  - SETUP: precio en pivot + RSI extremo (señal accionable)
+Alertas XAU/USD - v3
+Tres tipos de alertas:
+  - PROXIMIDAD: precio cerca de un pivot
+  - RSI EXTREMO: RSI sobrevendido/sobrecomprado (sin importar precio)
+  - SETUP: precio en pivot + RSI extremo (señal accionable, prioritaria)
 """
 
 import os
@@ -20,28 +21,28 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ===== CONFIGURACIÓN — edita aquí para ajustar =====
+# ===== CONFIGURACIÓN =====
 GOLD_TICKER = "GC=F"
 
-# Tolerancias (distancia al nivel en USD)
-PROXIMITY_TOLERANCE_PTS = 8.0   # Para alerta de acercamiento
-SETUP_TOLERANCE_PTS = 5.0       # Para setup completo
+# Tolerancias de distancia al nivel
+PROXIMITY_TOLERANCE_PTS = 8.0
+SETUP_TOLERANCE_PTS = 5.0
 
 # RSI
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
 
-# Cooldown - tiempo mínimo entre alertas del mismo tipo/nivel
+# Cooldowns (horas)
 PROXIMITY_COOLDOWN_HOURS = 1
 SETUP_COOLDOWN_HOURS = 2
+RSI_COOLDOWN_HOURS = 0.5  # 30 min
 
 STATE_FILE = "alert_state.json"
 MADRID_TZ = ZoneInfo("Europe/Madrid")
-# ====================================================
+# =========================
 
 
 def calculate_rsi(prices, period=14):
-    """RSI de Wilder (igual que TradingView/MT5)."""
     delta = prices.diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
@@ -52,7 +53,6 @@ def calculate_rsi(prices, period=14):
 
 
 def get_price_and_rsi():
-    """Precio actual y RSI(14) en M5."""
     try:
         t = yf.Ticker(GOLD_TICKER)
         hist = t.history(period="2d", interval="5m")
@@ -67,7 +67,6 @@ def get_price_and_rsi():
 
 
 def get_pivots_and_atr():
-    """Pivots clásicos del día anterior + ATR(14)."""
     try:
         t = yf.Ticker(GOLD_TICKER)
         hist = t.history(period="30d")
@@ -124,7 +123,6 @@ def is_in_cooldown(alert_key, state, now, hours):
 
 
 def position_vs_level(price, level_price):
-    """Devuelve descripción textual de la posición del precio."""
     diff = price - level_price
     if abs(diff) < 1:
         return "justo en"
@@ -135,37 +133,33 @@ def position_vs_level(price, level_price):
 
 
 def check_alerts(price, rsi, pivots, state):
-    """Detecta alertas de tipo SETUP (prioridad) o PROXIMIDAD."""
     alerts = []
     now = datetime.now(timezone.utc)
 
+    # ---- 1) Comprobar SETUP completo (mayor prioridad) ----
+    setup_levels = {}  # nivel → dirección
     for level_name, level_price in pivots.items():
         distance = abs(price - level_price)
-
-        # Si está fuera del rango de proximidad, ignorar
-        if distance > PROXIMITY_TOLERANCE_PTS:
+        if distance > SETUP_TOLERANCE_PTS:
             continue
+        direction = None
+        if level_name in ("S1", "S2") and rsi < RSI_OVERSOLD:
+            direction = "BUY"
+        elif level_name in ("R1", "R2") and rsi > RSI_OVERBOUGHT:
+            direction = "SELL"
+        elif level_name == "PP":
+            if rsi < RSI_OVERSOLD:
+                direction = "BUY"
+            elif rsi > RSI_OVERBOUGHT:
+                direction = "SELL"
 
-        # Comprobar primero si hay condiciones de SETUP
-        setup_direction = None
-        if distance <= SETUP_TOLERANCE_PTS:
-            if level_name in ("S1", "S2") and rsi < RSI_OVERSOLD:
-                setup_direction = "BUY"
-            elif level_name in ("R1", "R2") and rsi > RSI_OVERBOUGHT:
-                setup_direction = "SELL"
-            elif level_name == "PP":
-                if rsi < RSI_OVERSOLD:
-                    setup_direction = "BUY"
-                elif rsi > RSI_OVERBOUGHT:
-                    setup_direction = "SELL"
-
-        if setup_direction:
-            # Alerta SETUP (más prioritaria)
-            setup_key = f"SETUP_{setup_direction}_{level_name}"
+        if direction:
+            setup_key = f"SETUP_{direction}_{level_name}"
             if not is_in_cooldown(setup_key, state, now, SETUP_COOLDOWN_HOURS):
+                setup_levels[level_name] = direction
                 alerts.append({
                     "kind": "SETUP",
-                    "type": setup_direction,
+                    "type": direction,
                     "level": level_name,
                     "level_price": level_price,
                     "current_price": round(price, 2),
@@ -173,25 +167,46 @@ def check_alerts(price, rsi, pivots, state):
                     "distance": round(distance, 2),
                     "key": setup_key,
                 })
-        else:
-            # Alerta de PROXIMIDAD (sin condición RSI)
-            prox_key = f"PROX_{level_name}"
-            if not is_in_cooldown(prox_key, state, now, PROXIMITY_COOLDOWN_HOURS):
+
+    # ---- 2) PROXIMIDAD (sin RSI). Solo si no hay SETUP en ese mismo nivel ----
+    for level_name, level_price in pivots.items():
+        if level_name in setup_levels:
+            continue
+        distance = abs(price - level_price)
+        if distance > PROXIMITY_TOLERANCE_PTS:
+            continue
+        prox_key = f"PROX_{level_name}"
+        if not is_in_cooldown(prox_key, state, now, PROXIMITY_COOLDOWN_HOURS):
+            alerts.append({
+                "kind": "PROXIMITY",
+                "level": level_name,
+                "level_price": level_price,
+                "current_price": round(price, 2),
+                "rsi": round(rsi, 1),
+                "distance": round(distance, 2),
+                "position": position_vs_level(price, level_price),
+                "key": prox_key,
+            })
+
+    # ---- 3) RSI EXTREMO (sin importar precio). Solo si no hay SETUP ----
+    if rsi < RSI_OVERSOLD or rsi > RSI_OVERBOUGHT:
+        # Si ya hay un SETUP saltando, no añadir RSI suelto (la SETUP ya cubre el extremo)
+        if not setup_levels:
+            rsi_state_label = "OVERSOLD" if rsi < RSI_OVERSOLD else "OVERBOUGHT"
+            rsi_key = f"RSI_{rsi_state_label}"
+            if not is_in_cooldown(rsi_key, state, now, RSI_COOLDOWN_HOURS):
                 alerts.append({
-                    "kind": "PROXIMITY",
-                    "level": level_name,
-                    "level_price": level_price,
-                    "current_price": round(price, 2),
+                    "kind": "RSI",
+                    "rsi_state": rsi_state_label,
                     "rsi": round(rsi, 1),
-                    "distance": round(distance, 2),
-                    "position": position_vs_level(price, level_price),
-                    "key": prox_key,
+                    "current_price": round(price, 2),
+                    "key": rsi_key,
                 })
+
     return alerts
 
 
-def send_alert(alert, atr):
-    """Envía alerta formateada a Telegram."""
+def send_alert(alert, atr, pivots):
     now_madrid = datetime.now(MADRID_TZ).strftime("%H:%M")
 
     if alert["kind"] == "SETUP":
@@ -200,21 +215,44 @@ def send_alert(alert, atr):
         msg = (
             f"{emoji} *SETUP {alert['type']} XAU/USD* — {now_madrid}\n\n"
             f"Nivel: *{alert['level']}* en {alert['level_price']}\n"
-            f"Precio actual: {alert['current_price']}\n"
+            f"Precio: {alert['current_price']}\n"
             f"Distancia: {alert['distance']} pts\n"
             f"RSI(14) M5: *{alert['rsi']}* ({rsi_state})\n"
         )
         if atr:
             msg += f"ATR(14): {atr} pts\n"
         msg += f"\n_Setup completo: precio en {alert['level']} + RSI {rsi_state}_"
-    else:  # PROXIMITY
+
+    elif alert["kind"] == "PROXIMITY":
         msg = (
             f"📍 *Acercamiento a {alert['level']}* — {now_madrid}\n\n"
             f"Nivel: {alert['level']} en {alert['level_price']}\n"
             f"Precio: {alert['current_price']} ({alert['position']} {alert['level']})\n"
             f"Distancia: {alert['distance']} pts\n"
             f"RSI(14) M5: {alert['rsi']}\n\n"
-            f"_Vigila el nivel — sin confirmación de RSI extremo_"
+            f"_Vigila el nivel — sin confirmación de RSI_"
+        )
+
+    else:  # RSI extremo
+        if alert["rsi_state"] == "OVERSOLD":
+            emoji = "📊"
+            label = "RSI sobrevendido"
+            hint = "_Posible rebote alcista_"
+        else:
+            emoji = "📊"
+            label = "RSI sobrecomprado"
+            hint = "_Posible corrección bajista_"
+
+        # Distancia al pivot más cercano para contexto
+        nearest = min(pivots.items(), key=lambda x: abs(alert["current_price"] - x[1]))
+        dist_to_nearest = round(abs(alert["current_price"] - nearest[1]), 2)
+
+        msg = (
+            f"{emoji} *{label}* — {now_madrid}\n\n"
+            f"RSI(14) M5: *{alert['rsi']}*\n"
+            f"Precio: {alert['current_price']}\n"
+            f"Pivot más cercano: {nearest[0]} en {nearest[1]} ({dist_to_nearest} pts)\n\n"
+            f"{hint}"
         )
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -229,7 +267,6 @@ def send_alert(alert, atr):
 
 
 def cleanup_old_state(state):
-    """Limpia entradas más antiguas de 24h."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     cleaned = {}
     for k, v in state.items():
@@ -261,7 +298,7 @@ def main():
         now_iso = datetime.now(timezone.utc).isoformat()
         for alert in alerts:
             print(f"→ {alert['kind']}: {alert['key']}")
-            send_alert(alert, atr)
+            send_alert(alert, atr, pivots)
             state[alert["key"]] = now_iso
     else:
         print("Sin alertas")
